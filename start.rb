@@ -92,11 +92,13 @@ module Service
     attr_reader : username
     attr_reader : password
     attr_reader : base64Password
-    def initialize(address,port,username,password,base64Password)
+    attr_reader : id
+    def initialize(id,address,port,username,password,base64Password)
       @address = address
       @port = port
       @password = password
       @base64Password = base64Password
+      @id = id
     end
     def start
       $logger.info "starting proxy with ip #{address} and port #{port}"
@@ -150,7 +152,7 @@ module Service
     end
 
     def add_backend(backend)
-      @backends << {:name => 'proxy', :addr => backend.address, :port => backend.port, :password =>  backend.base64Password}
+      @backends << {:name => 'proxy', :id => backend.id, :addr => backend.address, :port => backend.port, :password =>  backend.base64Password}
     end
 
     private
@@ -168,7 +170,7 @@ proxy_username = ENV['username']
 proxy_password = ENV['password']
 base64Password = system("echo -n #{proxy_username}:#{proxy_password} | openssl enc -a")
 parsed.results.each { |p|
-proxy = Service::Proxy.new(p.address,p.port,p.username,p.password,base64Password)
+proxy = Service::Proxy.new(p.id,p.address,p.port,p.username,p.password,base64Password)
 haproxy.add_backend(proxy)
 proxy.start
 proxies << proxy
