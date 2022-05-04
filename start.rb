@@ -2,15 +2,20 @@
 require 'erb'
 require 'excon'
 require 'logger'
-
+require 'json'
+require 'rubygems'
+require 'httparty'
 $logger = Logger.new(STDOUT, ENV['DEBUG'] ? Logger::DEBUG : Logger::INFO)
 
 module Service
   class Base
     attr_reader :port
-
-    def initialize(port)
+    attr_reader :address
+    attr_reader :password
+    def initialize(address,port,password)
+      @address = address
       @port = port
+      @password = password
     end
 
     def service_name
@@ -81,103 +86,24 @@ module Service
     end
   end
 
-
-  class Tor < Base
-    attr_reader :port, :control_port
-
-    def initialize(port, control_port)
-        @port = port
-        @control_port = control_port
-    end
-
-    def data_directory
-      "#{super}/#{port}"
-    end
-
-    def start
-      super
-      self.class.fire_and_forget(executable,
-        "--SocksPort #{port}",
-	"--ControlPort #{control_port}",
-        "--NewCircuitPeriod 15",
-	"--MaxCircuitDirtiness 15",
-	"--UseEntryGuards 0",
-	"--UseEntryGuardsAsDirGuards 0",
-	"--CircuitBuildTimeout 5",
-	"--ExitRelay 0",
-	"--RefuseUnknownExits 0",
-	"--ClientOnly 1",
-	"--AllowSingleHopCircuits 1",
-        "--DataDirectory #{data_directory}",
-        "--PidFile #{pid_file}",
-        "--Log \"warn syslog\"",
-        '--RunAsDaemon 1',
-        "| logger -t 'tor' 2>&1")
-    end
-
-    def newnym
-        self.class.fire_and_forget('/usr/local/bin/newnym.sh',
-				   "#{control_port}",
-				   "| logger -t 'newnym'")
-    end
-  end
-
-  class Polipo < Base
-    def initialize(port, tor:)
-      super(port)
-      @tor = tor
-    end
-
-    def start
-      super
-      # https://gitweb.torproject.org/torbrowser.git/blob_plain/1ffcd9dafb9dd76c3a29dd686e05a71a95599fb5:/build-scripts/config/polipo.conf
-      if File.exists?(pid_file)
-        File.delete(pid_file)
-      end
-      self.class.fire_and_forget(executable,
-        "proxyPort=#{port}",
-        "socksParentProxy=127.0.0.1:#{tor_port}",
-        "socksProxyType=socks5",
-        "diskCacheRoot=''",
-        "disableLocalInterface=true",
-        "allowedClients=127.0.0.1",
-        "localDocumentRoot=''",
-        "disableConfiguration=true",
-        "dnsUseGethostbyname='yes'",
-        "logSyslog=true",
-        "daemonise=true",
-        "pidFile=#{pid_file}",
-        "disableVia=true",
-        "allowedPorts='1-65535'",
-        "tunnelAllowedPorts='1-65535'",
-        "| logger -t 'polipo' 2>&1")
-    end
-
-    def tor_port
-      @tor.port
-    end
-  end
-
   class Proxy
-    attr_reader :id
-    attr_reader :tor, :polipo
-
-    def initialize(id)
-      @id = id
-      @tor = Tor.new(tor_port, tor_control_port)
-      @polipo = Polipo.new(polipo_port, tor: tor)
+    attr_reader :address
+    attr_reader : port
+    attr_reader : username
+    attr_reader : password
+    attr_reader : base64Password
+    def initialize(address,port,username,password,base64Password)
+      @address = address
+      @port = port
+      @password = password
+      @base64Password = base64Password
     end
-
     def start
-      $logger.info "starting proxy id #{id}"
-      @tor.start
-      @polipo.start
+      $logger.info "starting proxy with ip #{address} and port #{port}"
     end
 
     def stop
-      $logger.info "stopping proxy id #{id}"
-      @tor.stop
-      @polipo.stop
+      $logger.info "stopping proxy with ip #{address} and port #{port}"
     end
 
     def restart
@@ -186,25 +112,12 @@ module Service
       start
     end
 
-    def tor_port
-      10000 + id
-    end
-
-    def tor_control_port
-      30000 + id
-    end
-
-    def polipo_port
-      tor_port + 10000
-    end
-    alias_method :port, :polipo_port
-
     def test_url
       ENV['test_url'] || 'http://icanhazip.com'
     end
 
     def working?
-      Excon.get(test_url, proxy: "http://127.0.0.1:#{port}", :read_timeout => 10).status == 200
+      Excon.get(test_url, proxy: "http://#{username}:#{password}@#{address}:#{port}", :read_timeout => 10).status == 200
     rescue
       false
     end
@@ -237,7 +150,7 @@ module Service
     end
 
     def add_backend(backend)
-      @backends << {:name => 'tor', :addr => '127.0.0.1', :port => backend.port}
+      @backends << {:name => 'proxy', :addr => backend.address, :port => backend.port, :password =>  backend.base64Password}
     end
 
     private
@@ -246,35 +159,30 @@ module Service
     end
   end
 end
-
 haproxy = Service::Haproxy.new
 proxies = []
-
-tor_instances = ENV['tors'] || 10
-tor_instances.to_i.times.each do |id|
-  proxy = Service::Proxy.new(id)
-  haproxy.add_backend(proxy)
-  proxy.start
-  proxies << proxy
-end
-
+proxies_url = ENV['proxies_url']
+proxies_json = HTTParty.get(proxies_url).body
+parsed = JSON.parse(proxies_json) 
+proxy_username = ENV['username']
+proxy_password = ENV['password']
+base64Password = system("echo -n #{proxy_username}:#{proxy_password} | openssl enc -a")
+parsed.results.each { |p|
+proxy = Service::Proxy.new(p.address,p.port,p.username,p.password,base64Password)
+haproxy.add_backend(proxy)
+proxy.start
+proxies << proxy
+}
 haproxy.start
 
 sleep 60
 
 loop do
-  $logger.info "resetting circuits"
-  proxies.each do |proxy|
-    $logger.info "reset nym for #{proxy.id} (port #{proxy.port})"
-    proxy.tor.newnym
-  end
-
   $logger.info "testing proxies"
   proxies.each do |proxy|
-    $logger.info "testing proxy #{proxy.id} (port #{proxy.port})"
+    $logger.info "testing proxy #{proxy.address} (port #{proxy.port})"
     proxy.restart unless proxy.working?
   end
-
   $logger.info "sleeping for 60 seconds"
   sleep 60
 end
